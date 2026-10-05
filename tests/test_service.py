@@ -1231,6 +1231,352 @@ class PrerequisiteTests(unittest.TestCase):
         self.assertEqual(ctx.exception.details["field"], "known_as_of")
 
 
+class ClosurePlanTests(unittest.TestCase):
+    """跨时段作业计划：整段区间内根及递归前置的分段可用性。"""
+
+    def setUp(self):
+        reset_db()
+
+    def _plan(self, number: str, start: str = t1, end: str = t5,
+              known: str = future):
+        return service.plan_closure_interval(number, start, end, known)
+
+    def _brief(self, res: dict):
+        out = []
+        for seg in res["segments"]:
+            if seg["error"] is None:
+                err = None
+            else:
+                e = seg["error"]
+                err = (e["code"], tuple(e.get("path") or []),
+                       tuple(e.get("cycle") or []))
+            out.append((seg["start"], seg["end"], seg["available"],
+                        [(i["number"], i["revision"]) for i in seg["items"]],
+                        err))
+        return out
+
+    def test_single_segment_when_nothing_changes(self):
+        release("PL-E", body="E正文")
+        release("PL-R", body="R正文", prerequisites=["PL-E"])
+        res = self._plan("PL-R")
+        self.assertTrue(res["available"])
+        self.assertEqual(res["count"], 1)
+        seg = res["segments"][0]
+        self.assertEqual((seg["start"], seg["end"]), (canon(t1), canon(t5)))
+        self.assertTrue(seg["available"])
+        self.assertIsNone(seg["error"])
+        self.assertEqual([i["number"] for i in seg["items"]],
+                         ["PL-E", "PL-R"])
+        self.assertEqual(res["root"], "PL-R")
+        self.assertEqual(res["work_start"], canon(t1))
+        self.assertEqual(res["work_end"], canon(t5))
+        self.assertEqual(res["known_as_of"], canon(future))
+
+    def test_segments_follow_version_boundaries_of_root_and_prerequisites(self):
+        # 前置 PL-B 在 3 月取更正版；根 PL-A 全年 r0 引用 PL-B
+        release("PL-B", body="B初版")
+        correct("PL-B", 0, t2, t3, "B三月版")
+        release("PL-A", body="A初版", prerequisites=["PL-B"])
+        res = self._plan("PL-A")
+        self.assertTrue(res["available"])
+        self.assertEqual([(s["start"], s["end"]) for s in res["segments"]],
+                         [(canon(t1), canon(t2)),
+                          (canon(t2), canon(t3)),
+                          (canon(t3), canon(t5))])
+        revs = [[(i["number"], i["revision"]) for i in s["items"]]
+                for s in res["segments"]]
+        self.assertEqual(revs[0], [("PL-B", 0), ("PL-A", 0)])
+        self.assertEqual(revs[1], [("PL-B", 1), ("PL-A", 0)])
+        self.assertEqual(revs[2], [("PL-B", 0), ("PL-A", 0)])
+
+    def test_prerequisite_list_change_adds_and_removes_member(self):
+        # 根 r0 全年带 [PL-C]；3 月更正 r1 显式清空 -> 该段只剩根
+        release("PL-C", body="C正文")
+        release("PL-D", body="D正文")
+        release("PL-G", body="G初版", prerequisites=["PL-C"])
+        correct("PL-G", 0, t2, t3, "G三月版", prerequisites=[])
+        correct("PL-G", 0, t3, t4, "G四月版", prerequisites=["PL-D"])
+        res = self._plan("PL-G")
+        self.assertEqual([(s["start"], s["end"]) for s in res["segments"]],
+                         [(canon(t1), canon(t2)),
+                          (canon(t2), canon(t3)),
+                          (canon(t3), canon(t4)),
+                          (canon(t4), canon(t5))])
+        members = [[i["number"] for i in s["items"]]
+                   for s in res["segments"]]
+        self.assertEqual(members, [["PL-C", "PL-G"], ["PL-G"],
+                                   ["PL-D", "PL-G"], ["PL-C", "PL-G"]])
+
+    def test_window_clipped_to_requested_interval(self):
+        release("PL-K", body="K初版")
+        correct("PL-K", 0, t2, t3, "K三月版")
+        # 只问 2-4 月：端点裁剪为 t2/t4，三段
+        res = self._plan("PL-K", t2, t4)
+        self.assertEqual([(s["start"], s["end"]) for s in res["segments"]],
+                         [(canon(t2), canon(t3)), (canon(t3), canon(t4))])
+        self.assertEqual(
+            [s["items"][0]["revision"] for s in res["segments"]], [1, 0])
+
+    def test_changes_outside_window_do_not_affect_result(self):
+        release("PL-O", body="O初版")
+        # 更正区间在作业窗口之外（12 月）：不应产生切点
+        correct("PL-O", 0, iso(_T + timedelta(days=335)), t5, "O十二月版")
+        res = self._plan("PL-O", t1, t4)
+        self.assertEqual(res["count"], 1)
+        self.assertEqual([(s["start"], s["end"]) for s in res["segments"]],
+                         [(canon(t1), canon(t4))])
+
+    def test_not_yet_visible_versions_do_not_create_segments(self):
+        # 更正发布于已知知悉时刻之后：该知悉时刻下不可见，不产生切点
+        release("PL-V", body="V初版")
+        published = correct("PL-V", 0, t2, t3, "V三月版")["published_at"]
+        dt = datetime.strptime(published, "%Y-%m-%dT%H:%M:%S.%fZ").replace(
+            tzinfo=timezone.utc)
+        before = iso_us(dt - timedelta(microseconds=1))
+        res = self._plan("PL-V", known=before)
+        self.assertEqual(res["count"], 1)
+        self.assertEqual(res["segments"][0]["items"][0]["revision"], 0)
+
+    def test_withdrawn_versions_do_not_create_segments_afterward(self):
+        release("PL-W", body="W初版")
+        correct("PL-W", 0, t2, t3, "W三月版")
+        withdraw("PL-W", 1)
+        # 撤回后知悉时刻：r1 不可见、区间恢复 r0 -> 整段恒定
+        res = self._plan("PL-W")
+        self.assertEqual(res["count"], 1)
+        self.assertEqual(res["segments"][0]["items"][0]["revision"], 0)
+        # 撤回前知悉时刻：r1 仍可见 -> 三段（历史不变）
+        import sqlite3
+        conn = sqlite3.connect(settings.db_path)
+        withdrawn_at = conn.execute(
+            "SELECT withdrawn_at FROM withdrawals w JOIN versions v "
+            "ON v.id=w.version_id JOIN procedures p ON p.id=v.procedure_id "
+            "WHERE p.number=?", ("PL-W",)).fetchone()[0]
+        conn.close()
+        dt = datetime.strptime(withdrawn_at, "%Y-%m-%dT%H:%M:%S.%fZ").replace(
+            tzinfo=timezone.utc)
+        res_before = self._plan("PL-W", known=iso_us(dt))
+        self.assertEqual(res_before["count"], 3)
+
+    def test_partial_gap_segment_kept_and_marked(self):
+        # 根 r0 全年无前置；3 月更正 r1 引用不存在编号 -> 仅 3 月段缺口
+        release("PL-H", body="H初版")
+        correct("PL-H", 0, t2, t3, "H三月版",
+                prerequisites=["PL-H-MISSING"])
+        res = self._plan("PL-H")
+        self.assertFalse(res["available"])
+        brief = self._brief(res)
+        self.assertEqual(brief, [
+            (canon(t1), canon(t2), True, [("PL-H", 0)], None),
+            (canon(t2), canon(t3), False, [],
+             ("prerequisite_not_found", ("PL-H", "PL-H-MISSING"), ())),
+            (canon(t3), canon(t5), True, [("PL-H", 0)], None),
+        ])
+        gap = res["segments"][1]
+        self.assertEqual(gap["error"]["number"], "PL-H-MISSING")
+        self.assertEqual(gap["items"], [])
+
+    def test_deep_gap_path_reported(self):
+        release("PL-Q1", prerequisites=["PL-Q2"])
+        release("PL-Q2", prerequisites=["PL-Q3-GONE"])
+        res = self._plan("PL-Q1")
+        self.assertFalse(res["available"])
+        err = res["segments"][0]["error"]
+        self.assertEqual(err["code"], "prerequisite_not_found")
+        self.assertEqual(err["path"], ["PL-Q1", "PL-Q2", "PL-Q3-GONE"])
+
+    def test_root_missing_keeps_whole_segment(self):
+        res = self._plan("PL-NO-SUCH")
+        self.assertFalse(res["available"])
+        self.assertEqual(res["count"], 1)
+        seg = res["segments"][0]
+        self.assertEqual((seg["start"], seg["end"]), (canon(t1), canon(t5)))
+        self.assertEqual(seg["error"]["code"], "not_found")
+        self.assertEqual(seg["error"]["number"], "PL-NO-SUCH")
+        self.assertEqual(seg["error"]["path"], ["PL-NO-SUCH"])
+
+    def test_no_applicable_version_segments_outside_validity(self):
+        # 根仅在 3 月有适用正文：窗口内前、后两段为缺口
+        release("PL-N", start=t2, end=t3)
+        res = self._plan("PL-N", t1, t4)
+        self.assertFalse(res["available"])
+        brief = self._brief(res)
+        self.assertEqual(brief, [
+            (canon(t1), canon(t2), False, [],
+             ("no_applicable_version", ("PL-N",), ())),
+            (canon(t2), canon(t3), True, [("PL-N", 0)], None),
+            (canon(t3), canon(t4), False, [],
+             ("no_applicable_version", ("PL-N",), ())),
+        ])
+
+    def test_prerequisite_no_applicable_version_in_subinterval(self):
+        # 前置仅 3 月有效；根全年引用它：3 月可用，其余段缺口
+        release("PL-PP", start=t2, end=t3, body="前置仅 3 月")
+        release("PL-RR", prerequisites=["PL-PP"])
+        res = self._plan("PL-RR", t1, t4)
+        self.assertFalse(res["available"])
+        statuses = [(s["available"],
+                     None if s["error"] is None else s["error"]["code"],
+                     s["error"]["path"] if s["error"] else None)
+                    for s in res["segments"]]
+        self.assertEqual(statuses, [
+            (False, "no_applicable_version", ["PL-RR", "PL-PP"]),
+            (True, None, None),
+            (False, "no_applicable_version", ["PL-RR", "PL-PP"]),
+        ])
+
+    def test_cycle_only_in_subinterval(self):
+        # 1-2 月：CA r0 -> [CB r0]，正常；3 月 CB 的适用版本 r1 反引 CA -> 环
+        release("PL-CB", body="B0")
+        release("PL-CA", body="A0", prerequisites=["PL-CB"])
+        correct("PL-CB", 0, t2, t3, "B1", prerequisites=["PL-CA"])
+        res = self._plan("PL-CA", t1, t4)
+        self.assertFalse(res["available"])
+        brief = self._brief(res)
+        self.assertEqual(brief, [
+            (canon(t1), canon(t2), True,
+             [("PL-CB", 0), ("PL-CA", 0)], None),
+            (canon(t2), canon(t3), False, [],
+             ("prerequisite_cycle", (), ("PL-CA", "PL-CB", "PL-CA"))),
+            (canon(t3), canon(t4), True,
+             [("PL-CB", 0), ("PL-CA", 0)], None),
+        ])
+
+    def test_self_cycle_segment(self):
+        release("PL-SC", prerequisites=["PL-SC"])
+        res = self._plan("PL-SC")
+        err = res["segments"][0]["error"]
+        self.assertEqual(err["code"], "prerequisite_cycle")
+        self.assertEqual(err["cycle"], ["PL-SC", "PL-SC"])
+
+    def test_identical_error_segments_merge_across_redundant_cuts(self):
+        # 缺口贯穿全窗口；缺口链上的中间规程 M 在 3 月有一次（继承同一引用的）
+        # 更正，其端点把窗口切成三段，但三段错误状态完全相同 -> 合并为一段。
+        release("PL-MM", prerequisites=["PL-GONE"])
+        correct("PL-MM", 0, t2, t3, "M三月版")   # 省略 -> 继承 [PL-GONE]
+        release("PL-TOP", prerequisites=["PL-MM"])
+        res = self._plan("PL-TOP", t1, t4)
+        self.assertFalse(res["available"])
+        self.assertEqual(res["count"], 1)
+        seg = res["segments"][0]
+        self.assertEqual((seg["start"], seg["end"]), (canon(t1), canon(t4)))
+        self.assertEqual(seg["error"]["path"],
+                         ["PL-TOP", "PL-MM", "PL-GONE"])
+
+    def test_different_errors_do_not_merge(self):
+        # 前段：引用不存在；后段：成环 —— 错误状态不同，不合并
+        release("PL-DA", prerequisites=["PL-DM"])
+        release("PL-DB", prerequisites=["PL-DA"])
+        # 2 月起 DA 改引 DB 成环（DA<->DB）：用 DA 的 2 月更正
+        correct("PL-DA", 0, t2, t4, "DA三月版", prerequisites=["PL-DB"])
+        res = self._plan("PL-DB", t1, t4)
+        self.assertFalse(res["available"])
+        self.assertEqual(len(res["segments"]), 2)
+        self.assertEqual(res["segments"][0]["error"]["code"],
+                         "prerequisite_not_found")
+        self.assertEqual(res["segments"][1]["error"]["code"],
+                         "prerequisite_cycle")
+
+    def test_diamond_dedup_and_order_preserved_per_segment(self):
+        release("PL-ZD", body="D")
+        release("PL-ZB", prerequisites=["PL-ZD"])
+        release("PL-ZC", prerequisites=["PL-ZD"])
+        release("PL-ZR", prerequisites=["PL-ZB", "PL-ZC", "PL-ZD"])
+        res = self._plan("PL-ZR")
+        self.assertEqual(
+            [i["number"] for i in res["segments"][0]["items"]],
+            ["PL-ZD", "PL-ZB", "PL-ZC", "PL-ZR"])
+
+    def test_segments_cover_full_window_without_gaps_or_overlap(self):
+        release("PL-U1")
+        correct("PL-U1", 0, t2, t3, "三月")
+        correct("PL-U1", 0, t3, t4, "四月")
+        res = self._plan("PL-U1")
+        segs = res["segments"]
+        self.assertEqual(segs[0]["start"], canon(t1))
+        self.assertEqual(segs[-1]["end"], canon(t5))
+        for a, b in zip(segs, segs[1:]):
+            self.assertEqual(a["end"], b["start"])   # 首尾相接、不重叠
+
+    def test_known_as_of_defaults_now(self):
+        release("PL-NW1")
+        release("PL-NW2", prerequisites=["PL-NW1"])
+        res = service.plan_closure_interval("PL-NW2", t1, t5, None)
+        self.assertTrue(res["available"])
+        self.assertEqual(res["count"], 1)
+        self.assertTrue(res["known_as_of"].endswith("Z"))
+
+    def test_offset_timezone_normalized(self):
+        release("PL-TZ")
+        res = self._plan("PL-TZ", "2026-01-01T08:00:00+08:00",
+                         "2027-01-01T08:00:00+08:00")
+        self.assertEqual(res["segments"][0]["start"], canon(t1))
+
+    def test_invalid_inputs_rejected_without_history(self):
+        release("PL-BAD")
+
+        def expect(code, *args):
+            with self.assertRaises(DomainError) as ctx:
+                service.plan_closure_interval(*args)
+            self.assertEqual(ctx.exception.code, code)
+
+        expect("invalid_interval", "PL-BAD", t2, t2, future)   # 空区间
+        expect("invalid_interval", "PL-BAD", t3, t2, future)   # 起晚于止
+        expect("invalid_time", "PL-BAD", "2026-01-01T00:00:00",
+               t5, future)                                      # 起点无时区
+        expect("invalid_time", "PL-BAD", t1,
+               "2027-01-01T00:00:00", future)                   # 终点无时区
+        expect("invalid_time", "PL-BAD", t1, t5,
+               "2030-01-01T00:00:00")                           # 知悉时刻无时区
+
+    def test_read_only_on_error(self):
+        # 缺口响应不写任何历史：versions/procedures 行数只来自发布
+        release("PL-RO", prerequisites=["PL-RO-GONE"])
+        before = service.list_history("PL-RO")["count"]
+        res = self._plan("PL-RO")
+        self.assertFalse(res["available"])
+        self.assertEqual(service.list_history("PL-RO")["count"], before)
+
+    def test_snapshot_consistency_under_concurrent_write(self):
+        # 计划解析在只读快照事务内完成：并发更正不得拼入中间结果
+        import threading
+        release("PL-CON-P", body="前置")
+        release("PL-CON-R", prerequisites=["PL-CON-P"])
+
+        def publish_later() -> None:
+            correct("PL-CON-P", 0, t2, t3, "前置三月版")
+
+        captured = []
+        barrier = threading.Event()
+
+        def plan() -> None:
+            # 直接在同一连接模型下无法插 barrier；改为在 read_snapshot 期间
+            # 触发写入：先开快照，再放行写线程，再做逐片段解析。
+            from app.db import read_snapshot
+            with read_snapshot() as conn:
+                barrier.set()
+                # 等写线程提交
+                publish_done.wait(1)
+                visible = service._visible_versions(
+                    conn, service._fetch_procedure(conn, "PL-CON-P")["id"],
+                    canon(future))
+                captured.append(len(visible))
+
+        publish_done = threading.Event()
+
+        def writer() -> None:
+            barrier.wait(1)
+            publish_later()
+            publish_done.set()
+
+        t = threading.Thread(target=writer)
+        t.start()
+        plan()
+        t.join()
+        # 快照在更正提交前固定：事务内只看到 r0 一条可见版本
+        self.assertEqual(captured, [1])
+
+
 class ApiTests(unittest.TestCase):
     """FastAPI 层：仅在依赖可用时运行。"""
 
@@ -1725,6 +2071,142 @@ class ApiTests(unittest.TestCase):
             "valid_end": t5})
         self.assertEqual(r.status_code, 201)
         self.assertEqual(r.json()["items"][0]["prerequisites"], [])
+
+    def test_closure_plan_over_http(self):
+        c = self.client
+        pre, root = self._n() + "-PRE", self._n() + "-ROOT"
+        c.post("/api/v1/releases", json={
+            "number": pre, "body": "前置正文", "valid_start": t1,
+            "valid_end": t5})
+        c.post("/api/v1/releases", json={
+            "number": root, "body": "根初版", "valid_start": t1,
+            "valid_end": t5, "prerequisites": [pre]})
+        # 3 月根更正：清空前置
+        c.post("/api/v1/corrections", json={
+            "number": root, "base_revision": 0,
+            "valid_start": t2, "valid_end": t3, "body": "根三月版",
+            "prerequisites": []})
+        # 前置 4 月更正：只影响 4 月的清单版本
+        c.post("/api/v1/corrections", json={
+            "number": pre, "base_revision": 0,
+            "valid_start": t3, "valid_end": t4, "body": "前置四月版"})
+
+        r = c.get(f"/api/v1/procedures/{root}/closure-plan", params={
+            "work_start": t1, "work_end": t5, "known_as_of": future})
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertEqual(body["root"], root)
+        self.assertTrue(body["available"])
+        self.assertEqual(body["count"], 4)
+        # 片段覆盖全区间、首尾相接
+        self.assertEqual(body["segments"][0]["start"], canon(t1))
+        self.assertEqual(body["segments"][-1]["end"], canon(t5))
+        for a, b in zip(body["segments"], body["segments"][1:]):
+            self.assertEqual(a["end"], b["start"])
+        members = [[i["number"] for i in s["items"]]
+                   for s in body["segments"]]
+        self.assertEqual(members, [[pre, root], [root], [pre, root],
+                                   [pre, root]])
+        # 4 月段前置取 r1、根取 r0；3 月段只剩根的 r1
+        self.assertEqual(body["segments"][2]["items"][0]["revision"], 1)
+        self.assertEqual(body["segments"][2]["items"][0]["body"],
+                         "前置四月版")
+        self.assertEqual(body["segments"][1]["items"][0]["revision"], 1)
+        self.assertTrue(all(s["error"] is None for s in body["segments"]))
+
+        # 区间裁剪：只问 2-4 月 -> 两段（2-3 月根无前置；3-4 月前置 r1）
+        r = c.get(f"/api/v1/procedures/{root}/closure-plan", params={
+            "work_start": t2, "work_end": t4, "known_as_of": future})
+        body = r.json()
+        self.assertEqual(body["count"], 2)
+        self.assertEqual(body["segments"][0]["start"], canon(t2))
+        self.assertEqual(body["segments"][-1]["end"], canon(t4))
+        self.assertEqual([[i["number"] for i in s["items"]]
+                          for s in body["segments"]],
+                         [[root], [pre, root]])
+
+    def test_closure_plan_gaps_and_cycle_over_http(self):
+        c = self.client
+        # 部分缺口：根 3 月更正引用不存在编号
+        n = self._n()
+        c.post("/api/v1/releases", json={
+            "number": n, "body": "根", "valid_start": t1, "valid_end": t5})
+        c.post("/api/v1/corrections", json={
+            "number": n, "base_revision": 0,
+            "valid_start": t2, "valid_end": t3, "body": "根三月",
+            "prerequisites": ["NO-SUCH-PRE"]})
+        r = c.get(f"/api/v1/procedures/{n}/closure-plan", params={
+            "work_start": t1, "work_end": t5})
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertFalse(body["available"])
+        gap = body["segments"][1]
+        self.assertFalse(gap["available"])
+        self.assertEqual(gap["items"], [])
+        self.assertEqual(gap["error"]["code"], "prerequisite_not_found")
+        self.assertEqual(gap["error"]["number"], "NO-SUCH-PRE")
+        self.assertEqual(gap["error"]["path"], [n, "NO-SUCH-PRE"])
+        # 其余两段可用
+        self.assertTrue(body["segments"][0]["available"])
+        self.assertTrue(body["segments"][2]["available"])
+
+        # 根编号不存在：缺口作为 200 片段返回（不做 404），整体不可用
+        r = c.get("/api/v1/procedures/NO-SUCH-PLAN/closure-plan", params={
+            "work_start": t1, "work_end": t5})
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        self.assertFalse(body["available"])
+        self.assertEqual(body["segments"][0]["error"]["code"], "not_found")
+        self.assertEqual(body["segments"][0]["error"]["path"],
+                         ["NO-SUCH-PLAN"])
+
+        # 成环：A<->B 整段环，片段带环路径
+        a, b = self._n() + "-A", self._n() + "-B"
+        c.post("/api/v1/releases", json={
+            "number": a, "body": "A", "valid_start": t1, "valid_end": t5,
+            "prerequisites": [b]})
+        c.post("/api/v1/releases", json={
+            "number": b, "body": "B", "valid_start": t1, "valid_end": t5,
+            "prerequisites": [a]})
+        r = c.get(f"/api/v1/procedures/{a}/closure-plan", params={
+            "work_start": t1, "work_end": t5})
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        self.assertFalse(body["available"])
+        self.assertEqual(body["segments"][0]["error"]["code"],
+                         "prerequisite_cycle")
+        self.assertEqual(body["segments"][0]["error"]["cycle"], [a, b, a])
+
+    def test_closure_plan_invalid_inputs_over_http(self):
+        c = self.client
+        n = self._n()
+        c.post("/api/v1/releases", json={
+            "number": n, "body": "根", "valid_start": t1, "valid_end": t5})
+        # 空作业区间 -> 422 invalid_interval
+        r = c.get(f"/api/v1/procedures/{n}/closure-plan", params={
+            "work_start": t2, "work_end": t2})
+        self.assertEqual(r.status_code, 422)
+        self.assertEqual(r.json()["error"]["code"], "invalid_interval")
+        # 起晚于止 -> 422 invalid_interval
+        r = c.get(f"/api/v1/procedures/{n}/closure-plan", params={
+            "work_start": t3, "work_end": t2})
+        self.assertEqual(r.status_code, 422)
+        self.assertEqual(r.json()["error"]["code"], "invalid_interval")
+        # 缺时区 -> 422 invalid_time
+        r = c.get(f"/api/v1/procedures/{n}/closure-plan", params={
+            "work_start": "2026-01-01T00:00:00", "work_end": t5})
+        self.assertEqual(r.status_code, 422)
+        self.assertEqual(r.json()["error"]["code"], "invalid_time")
+        r = c.get(f"/api/v1/procedures/{n}/closure-plan", params={
+            "work_start": t1, "work_end": t5,
+            "known_as_of": "2026-01-01T00:00:00"})
+        self.assertEqual(r.status_code, 422)
+        self.assertEqual(r.json()["error"]["code"], "invalid_time")
+        # 缺少必填参数 -> 422 validation_error
+        r = c.get(f"/api/v1/procedures/{n}/closure-plan",
+                  params={"work_start": t1})
+        self.assertEqual(r.status_code, 422)
+        self.assertEqual(r.json()["error"]["code"], "validation_error")
 
 
 if __name__ == "__main__":

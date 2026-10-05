@@ -68,6 +68,7 @@ def index() -> dict:
                 "GET  /api/v1/procedures/{number}/history",
                 "GET  /api/v1/procedures/{number}/diff",
                 "GET  /api/v1/procedures/{number}/closure",
+                "GET  /api/v1/procedures/{number}/closure-plan",
             ]}
 
 
@@ -149,6 +150,22 @@ def procedure_closure(number: str, work_time: str,
     任一规程当时无适用正文 -> 说明缺口并整体失败；引用成环 -> 返回环路径。
     """
     return service.resolve_closure(number, work_time, known_as_of)
+
+
+@app.get("/api/v1/procedures/{number}/closure-plan")
+def procedure_closure_plan(number: str, work_start: str, work_end: str,
+                           known_as_of: str | None = None) -> dict:
+    """跨时段作业计划：判断根规程及其递归前置在整个作业区间是否持续可用。
+
+    输入非空半开作业区间 [work_start, work_end) 与带时区知悉时刻，在同一
+    读取快照内找出根及递归引用在区间内的版本切换边界，切成覆盖全区间且互不
+    重叠的片段；每片段返回前置优先的去重清单及版本，根/引用缺失、无适用
+    正文、引用成环时保留该片段并标明缺口链/环路径，整体 available=false。
+    相邻片段仅在清单与错误状态完全相同时合并；区间外变动不影响结果。
+    非法区间/时间 -> 422（不写历史），片段上的缺口/环为 200 响应的一部分。
+    """
+    return service.plan_closure_interval(number, work_start, work_end,
+                                         known_as_of)
 
 
 @app.post("/api/v1/packages", status_code=201)

@@ -57,11 +57,26 @@
 - 递归解析（resolve_closure）在同一只读快照内按现有回溯语义展开根规程
   的传递闭包，前置优先、去重返回；缺口（根/引用不存在、当时无适用正文）
   整体失败并说明引用链，引用成环返回环路径、不返回部分清单。
+
+跨时段作业计划（plan_closure_interval）
+---------------------------------------
+班组计划跨时段作业时，把单时刻解析推广到整个非空作业区间
+``[work_start, work_end)``：
+
+- 在**同一只读快照**内，先沿知悉时刻下所有可见版本携带的前置编号找出根及
+  递归可能引用到的全部规程，再用这些规程可见版本在作业区间内的全部端点把
+  区间切成覆盖全区间、互不重叠的片段；区间外的版本不产生切点；
+- 每个片段以其起点（左闭右开）做一次与 resolve_closure 完全同语义的单时刻
+  解析，返回前置优先、去重清单及版本；根/引用缺失、无适用正文、引用成环时
+  **保留该片段**并在片段上标明缺口链或环路径（而不是整体抛错），任一片段
+  不可用则整体结论 ``available=false``；
+- 相邻片段仅在清单（编号 + 版本，含顺序）与错误状态完全相同时合并。
 """
 from __future__ import annotations
 
 import sqlite3
 import uuid
+from collections import deque
 
 from . import errors
 from .db import read_conn, read_snapshot, write_tx
@@ -689,6 +704,72 @@ def query_effective(work_time_raw: str, known_as_of_raw: str | None) -> dict:
 # ---------------------------------------------------------------- 前置规程递归解析
 
 
+def _evaluate_closure(conn: sqlite3.Connection, number: str,
+                      work_time: str, known_as_of: str) -> list[dict]:
+    """在给定读取快照（连接）内做一次单时刻递归解析；返回前置优先、去重的
+    清单项列表（含编号、版本、正文及各自前置列表），根在最后。
+
+    与 resolve_closure 的遍历语义完全一致，区别仅在于不负责解析入参、不开
+    事务：调用方（单时刻接口 / 跨时段计划的逐片段解析）保证快照与入参合法。
+    根/引用编号不存在、任一规程当时无适用正文、引用成环时抛出与单时刻接口
+    相同 code 的 DomainError（details 带引用链 path 或环路径 cycle）。
+    显式栈迭代式后序遍历：深链不触发递归上限。
+    """
+    items: list[dict] = []
+    state: dict[str, str] = {}          # 编号 -> visiting / done
+    path: list[str] = []                # 当前解析栈（引用链，供环与缺口说明）
+    frames: list[dict] = []             # 显式栈：深链不触发递归上限
+
+    def push(num: str) -> None:
+        proc = _fetch_procedure(conn, num)
+        if proc is None:
+            if not frames:
+                raise DomainError("not_found",
+                                  f"规程编号 {num or '(空)'} 不存在",
+                                  404, {"number": num})
+            raise errors.prerequisite_not_found(num, path + [num])
+        best, parent_rev = _resolve_effective(
+            conn, proc, work_time, known_as_of)
+        if best is None:
+            raise errors.closure_no_applicable_version(
+                num, work_time, known_as_of, path + [num])
+        state[num] = "visiting"
+        path.append(num)
+        frames.append({"number": num, "best": best,
+                       "parent_rev": parent_rev,
+                       "prerequisites": _prerequisites_of(conn, best["id"]),
+                       "next": 0})
+
+    push(number)
+    while frames:
+        frame = frames[-1]
+        descended = False
+        while frame["next"] < len(frame["prerequisites"]):
+            pre = frame["prerequisites"][frame["next"]]
+            frame["next"] += 1
+            pre_state = state.get(pre)
+            if pre_state == "done":
+                continue                    # 已解析过：去重，不重复展开
+            if pre_state == "visiting":
+                # 环：从首次出现到当前栈顶再回到它，整体失败、不给部分清单
+                raise errors.prerequisite_cycle(
+                    path[path.index(pre):] + [pre])
+            push(pre)
+            descended = True
+            break
+        if descended:
+            continue
+        # 全部前置已就位：本规程出栈入列（前置优先，根最后）
+        frames.pop()
+        path.pop()
+        state[frame["number"]] = "done"
+        payload = _version_payload(frame["best"], frame["number"],
+                                   frame["parent_rev"])
+        payload["prerequisites"] = frame["prerequisites"]
+        items.append(payload)
+    return items
+
+
 def resolve_closure(number_raw: str, work_time_raw: str,
                     known_as_of_raw: str | None) -> dict:
     """班组按一份规程准备作业：连同该时点有效的前置规程一起核对。
@@ -723,62 +804,161 @@ def resolve_closure(number_raw: str, work_time_raw: str,
                               {"field": "known_as_of"})
 
     with read_snapshot() as conn:
-        items: list[dict] = []
-        state: dict[str, str] = {}          # 编号 -> visiting / done
-        path: list[str] = []                # 当前解析栈（引用链，供环与缺口说明）
-        frames: list[dict] = []             # 显式栈：深链不触发递归上限
-
-        def push(num: str) -> None:
-            proc = _fetch_procedure(conn, num)
-            if proc is None:
-                if not frames:
-                    raise DomainError("not_found",
-                                      f"规程编号 {num or '(空)'} 不存在",
-                                      404, {"number": num})
-                raise errors.prerequisite_not_found(num, path + [num])
-            best, parent_rev = _resolve_effective(
-                conn, proc, work_time, known_as_of)
-            if best is None:
-                raise errors.closure_no_applicable_version(
-                    num, work_time, known_as_of, path + [num])
-            state[num] = "visiting"
-            path.append(num)
-            frames.append({"number": num, "best": best,
-                           "parent_rev": parent_rev,
-                           "prerequisites": _prerequisites_of(conn, best["id"]),
-                           "next": 0})
-
-        push(number)
-        while frames:
-            frame = frames[-1]
-            descended = False
-            while frame["next"] < len(frame["prerequisites"]):
-                pre = frame["prerequisites"][frame["next"]]
-                frame["next"] += 1
-                pre_state = state.get(pre)
-                if pre_state == "done":
-                    continue                    # 已解析过：去重，不重复展开
-                if pre_state == "visiting":
-                    # 环：从首次出现到当前栈顶再回到它，整体失败、不给部分清单
-                    raise errors.prerequisite_cycle(
-                        path[path.index(pre):] + [pre])
-                push(pre)
-                descended = True
-                break
-            if descended:
-                continue
-            # 全部前置已就位：本规程出栈入列（前置优先，根最后）
-            frames.pop()
-            path.pop()
-            state[frame["number"]] = "done"
-            payload = _version_payload(frame["best"], frame["number"],
-                                       frame["parent_rev"])
-            payload["prerequisites"] = frame["prerequisites"]
-            items.append(payload)
+        items = _evaluate_closure(conn, number, work_time, known_as_of)
 
     return {"root": number, "work_time": work_time,
             "known_as_of": known_as_of,
             "count": len(items), "items": items}
+
+
+# ---------------------------------------------------------------- 跨时段作业计划
+
+
+def _segment_error(exc: DomainError) -> dict:
+    """把单片段解析抛出的领域错误规整为片段上的错误状态。
+
+    只保留稳定 code 与定位缺口/环所需的最小字段（缺口链 path、环路径
+    cycle、缺口编号），使"错误状态完全相同"的相邻片段可确定性合并；
+    根缺失补齐 path=[number]，与引用链上的缺口形状一致。
+    """
+    details = exc.details or {}
+    error: dict = {"code": exc.code, "message": exc.message,
+                   "number": details.get("number"),
+                   "path": details.get("path")
+                          or ([details["number"]] if details.get("number")
+                              is not None else [])}
+    if exc.code == "prerequisite_cycle":
+        error["cycle"] = details.get("cycle", [])
+    return error
+
+
+def plan_closure_interval(number_raw: str,
+                          work_start_raw: str,
+                          work_end_raw: str,
+                          known_as_of_raw: str | None) -> dict:
+    """班组跨时段作业：判断根规程及其递归前置在整个作业区间是否持续可用。
+
+    输入根编号、非空半开作业区间 ``[work_start, work_end)`` 与带时区的知悉
+    时刻，按现有版本回溯与前置关系语义，在**同一只读快照**内：
+
+    1. 沿知悉时刻下所有可见版本携带的前置编号，找出根及递归"可能"引用到的
+       全部规程（存在即纳入，不要求某版本在区间内为最深正文——遗漏候选会
+       少切点，多纳入只会产生随后被合并的冗余切点）；
+    2. 用这些规程可见版本与作业区间相交的全部端点把区间切成覆盖全区间、互不
+       重叠的片段；区间外版本（含知悉时刻尚不可见者）不产生切点；
+    3. 每个片段以起点（左闭右开）做一次与 resolve_closure 同语义的单时刻解析，
+       片段内根及各前置的适用版本与引用关系恒定；成功片段给前置优先、去重
+       清单及版本，根/引用缺失、无适用正文、引用成环时**保留片段**并在片段
+       上标明缺口链或环路径；
+    4. 相邻片段仅在清单（编号 + 版本，含顺序）与错误状态完全相同时合并。
+
+    返回整体结论 ``available``：全部片段可用才为 true，任一不可用即为 false。
+    本接口只读、不写历史；非法区间/时间 -> 422（invalid_interval/
+    invalid_time），片段上的缺口/环不作为 HTTP 错误，而是 200 响应的一部分。
+    """
+    number = number_raw.strip()
+    try:
+        work_start = parse_canonical(work_start_raw, "work_start")
+    except TimeParseError as exc:
+        raise DomainError("invalid_time", str(exc), 422,
+                          {"field": "work_start"})
+    try:
+        work_end = parse_canonical(work_end_raw, "work_end")
+    except TimeParseError as exc:
+        raise DomainError("invalid_time", str(exc), 422,
+                          {"field": "work_end"})
+    if not work_start < work_end:
+        raise errors.invalid_interval(
+            work_start, work_end,
+            "作业区间非法：work_start 必须严格早于 work_end（区间为 [起, 止) 且长度大于 0）")
+    if known_as_of_raw is None or not str(known_as_of_raw).strip():
+        known_as_of = now_canonical()
+    else:
+        try:
+            known_as_of = parse_canonical(known_as_of_raw, "known_as_of")
+        except TimeParseError as exc:
+            raise DomainError("invalid_time", str(exc), 422,
+                              {"field": "known_as_of"})
+
+    with read_snapshot() as conn:
+        # 1) 发现阶段：从根出发，沿知悉时刻下所有**可见版本**携带的前置编号
+        #    求传递可达的规程集合（按编号去重）。引用到尚不存在的编号时记录
+        #    为外部缺失名——它本身无版本端点，但会在片段解析时按缺口标出。
+        reachable: dict[str, sqlite3.Row | None] = {}
+        queue: deque[str] = deque([number])
+        while queue:
+            num = queue.popleft()
+            if num in reachable:
+                continue
+            proc = _fetch_procedure(conn, num)
+            reachable[num] = proc
+            if proc is None:
+                continue
+            for v in _visible_versions(conn, proc["id"], known_as_of):
+                for pre in _prerequisites_of(conn, v["id"]):
+                    if pre not in reachable:
+                        queue.append(pre)
+
+        # 2) 切点：作业区间端点 + 每个可达规程可见版本与区间相交部分的端点。
+        #    区间外版本（不相交）不产生切点；片段内各规程的适用版本恒定。
+        bounds = {work_start, work_end}
+        for proc in reachable.values():
+            if proc is None:
+                continue
+            for v in _visible_versions(conn, proc["id"], known_as_of):
+                if v["valid_end"] <= work_start or work_end <= v["valid_start"]:
+                    continue                        # 与作业区间不相交
+                bounds.add(max(v["valid_start"], work_start))
+                bounds.add(min(v["valid_end"], work_end))
+        ordered = sorted(bounds)
+
+        # 3) 逐片段做单时刻闭包解析（取片段起点，左闭右开）。
+        raw: list[tuple[str, str, tuple, dict | None, list[dict]]] = []
+        for s, e in zip(ordered, ordered[1:]):
+            try:
+                items = _evaluate_closure(conn, number, s, known_as_of)
+                signature = tuple((it["number"], it["revision"]) for it in items)
+                raw.append((s, e, signature, None, items))
+            except DomainError as exc:
+                error = _segment_error(exc)
+                # 错误状态签名：code + 缺口链/环路径（+ 缺口编号），完全相同
+                # 才允许跨片段合并。
+                signature = ("__error__", error["code"],
+                             tuple(error.get("path") or []),
+                             tuple(error.get("cycle") or []),
+                             error.get("number"))
+                raw.append((s, e, signature, error, []))
+
+        # 4) 合并首尾相接且清单与错误状态完全相同的相邻片段。
+        merged: list[tuple[str, str, tuple, dict | None, list[dict]]] = []
+        for seg in raw:
+            s, e, signature, error, items = seg
+            if merged and merged[-1][1] == s and merged[-1][2] == signature:
+                ps, _pe, _sig, _err, _items = merged[-1]
+                merged[-1] = (ps, e, signature, error, items)
+            else:
+                merged.append(seg)
+
+        segments: list[dict] = []
+        available = True
+        for s, e, _signature, error, items in merged:
+            available_seg = error is None
+            available = available and available_seg
+            segments.append({
+                "start": s,
+                "end": e,
+                "available": available_seg,
+                "items": items,
+                "error": error,
+            })
+
+    return {"root": number,
+            "work_start": work_start,
+            "work_end": work_end,
+            "known_as_of": known_as_of,
+            "available": available,
+            "count": len(segments),
+            "segments": segments}
 
 # ---------------------------------------------------------------- 历史查看
 

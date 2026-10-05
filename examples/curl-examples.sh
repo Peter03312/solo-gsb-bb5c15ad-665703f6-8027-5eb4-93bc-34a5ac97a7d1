@@ -407,3 +407,112 @@ curl -sS -i -X POST "$BASE_URL/api/v1/releases" \
         "valid_end":   "2027-01-01T00:00:00Z",
         "prerequisites": ["  "]
       }'; echo
+
+# ------------------------------------------------------------------------
+# 跨时段作业计划（本轮新增）：输入根编号 + 非空半开作业区间 + 知悉时刻，
+# 在同一读取快照内按版本切换边界把区间切段，逐段给前置优先的去重清单及
+# 版本；缺口/环保留在片段上（error 带缺口链 path / 环路径 cycle），整体
+# available=false。相邻片段仅在清单与错误状态完全相同时合并。
+# ------------------------------------------------------------------------
+
+# --- 29. 计划用数据：前置 SOP-PLAN-101 全年有效、3 月有更正 ----------------
+curl -sS -X POST "$BASE_URL/api/v1/releases" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "number": "SOP-PLAN-101",
+        "body": "前置规程初版：动火作业须办理动火证。",
+        "valid_start": "2026-01-01T00:00:00Z",
+        "valid_end":   "2027-01-01T00:00:00Z"
+      }'; echo
+curl -sS -X POST "$BASE_URL/api/v1/corrections" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "number": "SOP-PLAN-101", "base_revision": 0,
+        "valid_start": "2026-03-01T00:00:00Z",
+        "valid_end":   "2026-04-01T00:00:00Z",
+        "body": "前置规程 3 月版：检修期加派监护。"
+      }'; echo
+# 根全年引用前置，4 月更正显式清空前置
+curl -sS -X POST "$BASE_URL/api/v1/releases" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "number": "SOP-PLAN-001",
+        "body": "根规程初版：检修作业总体要求。",
+        "valid_start": "2026-01-01T00:00:00Z",
+        "valid_end":   "2027-01-01T00:00:00Z",
+        "prerequisites": ["SOP-PLAN-101"]
+      }'; echo
+curl -sS -X POST "$BASE_URL/api/v1/corrections" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "number": "SOP-PLAN-001", "base_revision": 0,
+        "valid_start": "2026-04-01T00:00:00Z",
+        "valid_end":   "2026-05-01T00:00:00Z",
+        "body": "根规程 4 月版：本阶段不引用前置。",
+        "prerequisites": []
+      }'; echo
+
+# --- 30. 全年作业区间计划：4 段（前置 3 月换版；根 4 月无前置；5 月恢复） --
+curl -sS --get "$BASE_URL/api/v1/procedures/SOP-PLAN-001/closure-plan" \
+  --data-urlencode 'work_start=2026-01-01T00:00:00Z' \
+  --data-urlencode 'work_end=2027-01-01T00:00:00Z'; echo
+
+# --- 31. 收窄到 2 月中-5 月中：区间端点被裁剪，片段仍覆盖全区间 ------------
+curl -sS --get "$BASE_URL/api/v1/procedures/SOP-PLAN-001/closure-plan" \
+  --data-urlencode 'work_start=2026-02-15T00:00:00Z' \
+  --data-urlencode 'work_end=2026-05-15T00:00:00Z'; echo
+
+# --- 32. 部分缺口：另一根规程 3 月更正引用尚不存在的前置编号 ---------------
+# 响应仍为 200，3 月段 available=false、error 带缺口链，整体 available=false
+curl -sS -X POST "$BASE_URL/api/v1/releases" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "number": "SOP-PLAN-002",
+        "body": "根规程初版。",
+        "valid_start": "2026-01-01T00:00:00Z",
+        "valid_end":   "2027-01-01T00:00:00Z"
+      }'; echo
+curl -sS -X POST "$BASE_URL/api/v1/corrections" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "number": "SOP-PLAN-002", "base_revision": 0,
+        "valid_start": "2026-03-01T00:00:00Z",
+        "valid_end":   "2026-04-01T00:00:00Z",
+        "body": "根规程 3 月版：临时引用缺失规程。",
+        "prerequisites": ["SOP-PLAN-GONE"]
+      }'; echo
+curl -sS --get "$BASE_URL/api/v1/procedures/SOP-PLAN-002/closure-plan" \
+  --data-urlencode 'work_start=2026-01-01T00:00:00Z' \
+  --data-urlencode 'work_end=2026-06-01T00:00:00Z'; echo
+
+# --- 33. 根编号不存在：整段即一个 not_found 缺口片段（HTTP 200） -----------
+curl -sS --get "$BASE_URL/api/v1/procedures/NO-SUCH-PLAN/closure-plan" \
+  --data-urlencode 'work_start=2026-01-01T00:00:00Z' \
+  --data-urlencode 'work_end=2026-07-01T00:00:00Z'; echo
+
+# --- 34. 引用成环：片段带环路径 cycle，整体 available=false ----------------
+curl -sS -X POST "$BASE_URL/api/v1/releases" \
+  -H 'Content-Type: application/json' \
+  -d '{"number": "SOP-PLAN-CA", "body": "A 引用 B",
+        "valid_start": "2026-01-01T00:00:00Z",
+        "valid_end":   "2027-01-01T00:00:00Z",
+        "prerequisites": ["SOP-PLAN-CB"]}'; echo
+curl -sS -X POST "$BASE_URL/api/v1/releases" \
+  -H 'Content-Type: application/json' \
+  -d '{"number": "SOP-PLAN-CB", "body": "B 引用 A",
+        "valid_start": "2026-01-01T00:00:00Z",
+        "valid_end":   "2027-01-01T00:00:00Z",
+        "prerequisites": ["SOP-PLAN-CA"]}'; echo
+curl -sS --get "$BASE_URL/api/v1/procedures/SOP-PLAN-CA/closure-plan" \
+  --data-urlencode 'work_start=2026-01-01T00:00:00Z' \
+  --data-urlencode 'work_end=2026-07-01T00:00:00Z'; echo
+
+# --- 35a. 空作业区间（起=止） -> 422 invalid_interval，不写历史 ------------
+curl -sS -i --get "$BASE_URL/api/v1/procedures/SOP-PLAN-001/closure-plan" \
+  --data-urlencode 'work_start=2026-03-01T00:00:00Z' \
+  --data-urlencode 'work_end=2026-03-01T00:00:00Z'; echo
+
+# --- 35b. 时刻缺时区 -> 422 invalid_time -----------------------------------
+curl -sS -i --get "$BASE_URL/api/v1/procedures/SOP-PLAN-001/closure-plan" \
+  --data-urlencode 'work_start=2026-01-01T00:00:00' \
+  --data-urlencode 'work_end=2027-01-01T00:00:00Z'; echo

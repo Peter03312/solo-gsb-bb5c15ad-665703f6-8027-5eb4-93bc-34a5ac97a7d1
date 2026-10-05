@@ -125,6 +125,9 @@ def main() -> None:
     # 12) 前置规程（本轮新增）：携带列表发布/更正，递归解析前置清单
     _prerequisite_examples()
 
+    # 13) 跨时段作业计划：整段区间内根及递归前置的分段可用性
+    _closure_plan_examples()
+
 
 def _withdrawal_examples() -> None:
     """撤回示例：撤回只追加事件，撤回前历史不变，撤回后区间恢复父版本正文。"""
@@ -428,6 +431,125 @@ def _prerequisite_examples() -> None:
         "valid_end": "2027-01-01T00:00:00Z",
         "prerequisites": ["  "]})
     show("12.8b 前置编号空白 -> 422 invalid_number", status, res)
+
+
+def _closure_plan_examples() -> None:
+    """跨时段作业计划：按作业区间切段，逐段给前置清单/版本与可用结论。"""
+    import urllib.parse
+
+    pre = "SOP-DEMO-PLAN-101"
+    root = "SOP-DEMO-PLAN-001"
+
+    # 13.1) 前置全年有效，3 月有一条更正；根全年引用前置
+    call("POST", "/api/v1/releases", {
+        "number": pre,
+        "body": "前置规程初版：动火作业须办理动火证。",
+        "valid_start": "2026-01-01T00:00:00Z",
+        "valid_end": "2027-01-01T00:00:00Z",
+    })
+    call("POST", "/api/v1/corrections", {
+        "number": pre, "base_revision": 0,
+        "valid_start": "2026-03-01T00:00:00Z",
+        "valid_end": "2026-04-01T00:00:00Z",
+        "body": "前置规程 3 月版：检修期加派监护。",
+    })
+    call("POST", "/api/v1/releases", {
+        "number": root,
+        "body": "根规程初版：检修作业总体要求。",
+        "valid_start": "2026-01-01T00:00:00Z",
+        "valid_end": "2027-01-01T00:00:00Z",
+        "prerequisites": [pre],
+    })
+    # 13.2) 根 4 月更正显式清空前置 -> 4 月段清单只剩根
+    call("POST", "/api/v1/corrections", {
+        "number": root, "base_revision": 0,
+        "valid_start": "2026-04-01T00:00:00Z",
+        "valid_end": "2026-05-01T00:00:00Z",
+        "body": "根规程 4 月版：本阶段不引用前置。",
+        "prerequisites": [],
+    })
+
+    q = urllib.parse.urlencode({
+        "work_start": "2026-01-01T00:00:00Z",
+        "work_end": "2027-01-01T00:00:00Z",
+    })
+    status, res = call("GET", f"/api/v1/procedures/{root}/closure-plan?{q}")
+    show("13.3 跨时段计划（切段：前置 3 月换版、根 4 月清空前置）", status, res)
+    assert res["available"] is True
+    assert [len(s["items"]) for s in res["segments"]] == [2, 2, 1, 2]
+
+    # 13.4) 只问 2-5 月：区间外端点被裁剪，片段仍首尾相接覆盖全区间
+    q = urllib.parse.urlencode({
+        "work_start": "2026-02-01T00:00:00Z",
+        "work_end": "2026-05-15T00:00:00Z",
+    })
+    status, res = call("GET", f"/api/v1/procedures/{root}/closure-plan?{q}")
+    show("13.4 收窄到 2 月中-5 月中（区间裁剪）", status, res)
+
+    # 13.5) 部分缺口：另一根规程 3 月更正引用了尚不存在的前置编号
+    gap_root = "SOP-DEMO-PLAN-002"
+    call("POST", "/api/v1/releases", {
+        "number": gap_root,
+        "body": "根规程初版。",
+        "valid_start": "2026-01-01T00:00:00Z",
+        "valid_end": "2027-01-01T00:00:00Z",
+    })
+    call("POST", "/api/v1/corrections", {
+        "number": gap_root, "base_revision": 0,
+        "valid_start": "2026-03-01T00:00:00Z",
+        "valid_end": "2026-04-01T00:00:00Z",
+        "body": "根规程 3 月版：临时引用缺失规程。",
+        "prerequisites": ["SOP-DEMO-PLAN-GONE"],
+    })
+    q = urllib.parse.urlencode({
+        "work_start": "2026-01-01T00:00:00Z",
+        "work_end": "2026-06-01T00:00:00Z",
+    })
+    status, res = call(
+        "GET", f"/api/v1/procedures/{gap_root}/closure-plan?{q}")
+    show("13.5 部分缺口（3 月段引用不存在编号，片段保留、整体不可用）",
+         status, res)
+    assert res["available"] is False
+    assert res["segments"][1]["error"]["code"] == "prerequisite_not_found"
+    assert res["segments"][1]["error"]["path"] == [
+        gap_root, "SOP-DEMO-PLAN-GONE"]
+
+    # 13.6) 根编号不存在：整段即一个 not_found 缺口片段（仍为 200）
+    status, res = call(
+        "GET", "/api/v1/procedures/NO-SUCH-PLAN/closure-plan?"
+               "work_start=2026-01-01T00:00:00Z"
+               "&work_end=2026-07-01T00:00:00Z")
+    show("13.6 根编号不存在（缺口片段，available=false）", status, res)
+
+    # 13.7) 引用成环：片段带环路径
+    cyc_a, cyc_b = "SOP-DEMO-PLAN-CA", "SOP-DEMO-PLAN-CB"
+    call("POST", "/api/v1/releases", {
+        "number": cyc_a, "body": "A 引用 B",
+        "valid_start": "2026-01-01T00:00:00Z",
+        "valid_end": "2027-01-01T00:00:00Z",
+        "prerequisites": [cyc_b]})
+    call("POST", "/api/v1/releases", {
+        "number": cyc_b, "body": "B 引用 A",
+        "valid_start": "2026-01-01T00:00:00Z",
+        "valid_end": "2027-01-01T00:00:00Z",
+        "prerequisites": [cyc_a]})
+    status, res = call(
+        "GET", f"/api/v1/procedures/{cyc_a}/closure-plan?"
+               "work_start=2026-01-01T00:00:00Z"
+               "&work_end=2026-07-01T00:00:00Z")
+    show("13.7 引用成环（环路径片段，available=false）", status, res)
+
+    # 13.8) 非法入参 -> 422（只读、不写历史）
+    status, res = call(
+        "GET", f"/api/v1/procedures/{root}/closure-plan?"
+               "work_start=2026-03-01T00:00:00Z"
+               "&work_end=2026-03-01T00:00:00Z")
+    show("13.8a 空作业区间 -> 422 invalid_interval", status, res)
+    status, res = call(
+        "GET", f"/api/v1/procedures/{root}/closure-plan?"
+               "work_start=2026-01-01T00:00:00"       # 缺时区
+               "&work_end=2027-01-01T00:00:00Z")
+    show("13.8b 时刻缺时区 -> 422 invalid_time", status, res)
 
 
 def _diff_examples(number: str, published_r1: str) -> None:
