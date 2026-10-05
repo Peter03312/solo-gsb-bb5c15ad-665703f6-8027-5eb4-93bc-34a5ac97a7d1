@@ -407,3 +407,73 @@ curl -sS -i -X POST "$BASE_URL/api/v1/releases" \
         "valid_end":   "2027-01-01T00:00:00Z",
         "prerequisites": ["  "]
       }'; echo
+
+# ------------------------------------------------------------------------
+# 跨时段前置规程清单（本轮新增）：班组计划跨时段作业时，判断根规程及其递归
+# 前置在整个非空作业区间 [work_start, work_end) 是否持续可用。同一读取快照
+# 内按版本切换边界切成覆盖全区间、互不重叠的片段；每片段返回前置优先的去重
+# 清单及版本；根/引用缺失、无适用正文、引用成环时保留该片段并标缺口链/环
+# 路径（整体 available=false）；相邻片段仅在清单与错误状态完全相同时合并。
+# 前置数据：SOP-PRE-001 的 r1（3 月）携带 [SOP-PRE-101, SOP-PRE-102]，
+#           4 月更正 r2 清空前置。
+# ------------------------------------------------------------------------
+
+# --- 29. 全年作业区间：3 月 / 4 月两段引用不同，其余月份同为 r0 前置 --------
+#       两端状态相同但被中间片段隔开 -> 不合并，共 4 段且全部 available
+curl -sS --get "$BASE_URL/api/v1/procedures/SOP-PRE-001/closure-plan" \
+  --data-urlencode 'work_start=2026-01-01T00:00:00Z' \
+  --data-urlencode 'work_end=2027-01-01T00:00:00Z'; echo
+
+# --- 30. 收窄作业区间到 3-4 月：端点裁剪到请求区间，只保留相交片段 ----------
+curl -sS --get "$BASE_URL/api/v1/procedures/SOP-PRE-001/closure-plan" \
+  --data-urlencode 'work_start=2026-03-01T00:00:00Z' \
+  --data-urlencode 'work_end=2026-05-01T00:00:00Z'; echo
+
+# --- 31. 引用不存在：SOP-PRE-002 携带尚未发布的 SOP-PRE-103（后已发布） ----
+#       用其 3 月前的状态演示：再发一个只在 3 月引用不存在编号的根规程
+curl -sS -X POST "$BASE_URL/api/v1/releases" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "number": "SOP-PLAN-GAP",
+        "body": "根初版（无前置）。",
+        "valid_start": "2026-01-01T00:00:00Z",
+        "valid_end":   "2027-01-01T00:00:00Z",
+        "prerequisites": []
+      }'; echo
+curl -sS -X POST "$BASE_URL/api/v1/corrections" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "number": "SOP-PLAN-GAP",
+        "base_revision": 0,
+        "valid_start": "2026-03-01T00:00:00Z",
+        "valid_end":   "2026-04-01T00:00:00Z",
+        "body": "3 月版本引用了一个不存在的前置。",
+        "prerequisites": ["SOP-PLAN-MISSING"]
+      }'; echo
+# 3 月片段 available=false 且 gaps 带缺口链 ["SOP-PLAN-GAP","SOP-PLAN-MISSING"]；
+# 其余片段正常，顶层 available=false（HTTP 仍为 200）
+curl -sS --get "$BASE_URL/api/v1/procedures/SOP-PLAN-GAP/closure-plan" \
+  --data-urlencode 'work_start=2026-01-01T00:00:00Z' \
+  --data-urlencode 'work_end=2027-01-01T00:00:00Z'; echo
+
+# --- 32. 根编号不存在：保留单片段，gaps[0].code=not_found，整体不可用 --------
+curl -sS --get "$BASE_URL/api/v1/procedures/NO-SUCH-PLAN/closure-plan" \
+  --data-urlencode 'work_start=2026-01-01T00:00:00Z' \
+  --data-urlencode 'work_end=2027-01-01T00:00:00Z'; echo
+
+# --- 33. 引用成环：环片段保留并给出 cycle 环路径（HTTP 200，片段不可用） ----
+curl -sS --get "$BASE_URL/api/v1/procedures/SOP-CYC-A/closure-plan" \
+  --data-urlencode 'work_start=2026-01-01T00:00:00Z' \
+  --data-urlencode 'work_end=2027-01-01T00:00:00Z'; echo
+
+# --- 34a. 空作业区间（起=止） -> 422 invalid_interval（只读、不写历史） -----
+curl -sS -i --get "$BASE_URL/api/v1/procedures/SOP-PRE-001/closure-plan" \
+  --data-urlencode 'work_start=2026-03-01T00:00:00Z' \
+  --data-urlencode 'work_end=2026-03-01T00:00:00Z'; echo
+
+# --- 34b. 时刻缺时区 -> 422 invalid_time；缺少 work_end -> 422 --------------
+curl -sS -i --get "$BASE_URL/api/v1/procedures/SOP-PRE-001/closure-plan" \
+  --data-urlencode 'work_start=2026-01-01T00:00:00' \
+  --data-urlencode 'work_end=2027-01-01T00:00:00Z'; echo
+curl -sS -i --get "$BASE_URL/api/v1/procedures/SOP-PRE-001/closure-plan" \
+  --data-urlencode 'work_start=2026-01-01T00:00:00Z'; echo

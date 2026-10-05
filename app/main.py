@@ -20,7 +20,7 @@ app = FastAPI(
     description=("双时间维（适用时间 / 发布时间）规程版本库：首次发布、更正、"
                  "误发布更正的撤回（只追加事件）、按作业时刻+知悉时刻回溯查询、"
                  "两知悉时刻区间对比、作业规程包的固定/取回/复核，以及前置规程"
-                 "清单的递归解析（发布/更正可携带前置编号，按版本生效）。"),
+                 "清单的递归解析（单时刻闭包与跨时段作业区间的逐片段可用性）。"),
 )
 
 
@@ -68,6 +68,7 @@ def index() -> dict:
                 "GET  /api/v1/procedures/{number}/history",
                 "GET  /api/v1/procedures/{number}/diff",
                 "GET  /api/v1/procedures/{number}/closure",
+                "GET  /api/v1/procedures/{number}/closure-plan",
             ]}
 
 
@@ -149,6 +150,22 @@ def procedure_closure(number: str, work_time: str,
     任一规程当时无适用正文 -> 说明缺口并整体失败；引用成环 -> 返回环路径。
     """
     return service.resolve_closure(number, work_time, known_as_of)
+
+
+@app.get("/api/v1/procedures/{number}/closure-plan")
+def procedure_closure_plan(number: str, work_start: str, work_end: str,
+                           known_as_of: str | None = None) -> dict:
+    """跨时段前置规程清单：班组计划跨时段作业时，判断根规程及其递归前置在
+    整个非空作业区间 [work_start, work_end) 内是否持续可用。
+
+    在同一读取快照内按现有回溯与前置关系语义找出根及递归引用的版本切换
+    边界，切成覆盖全区间、互不重叠的片段；每片段返回前置优先的去重清单及
+    版本。根/引用缺失、无适用正文或引用成环时保留该片段并以缺口链/环路径
+    标记（该片段与整体结论均为不可用）；相邻片段仅在清单与错误状态完全
+    相同时合并，区间外的变动不影响结果。非法区间或时间直接 422、不写历史。
+    """
+    return service.resolve_closure_plan(number, work_start, work_end,
+                                        known_as_of)
 
 
 @app.post("/api/v1/packages", status_code=201)
